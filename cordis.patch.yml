@@ -1,0 +1,5 @@
+# Bundle patch layer for dsh-turbo.
+# New plugin rows are inserted with the `insert` list (not id-overrides).
+- insert:
+    - id: turbo
+      name: dsh-turbo
