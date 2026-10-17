@@ -1,7 +1,9 @@
 # dsh-turbo
 
 Agent speed pack for DeepSeek Harness. Cuts model round-trips — the dominant
-wall-clock cost of an agent step — for every session in the profile.
+wall-clock cost of an agent step — and, since v1.4, the model's thinking time
+itself: while the pack is on, every request is forced to a fast reasoning
+effort, so the "Deep diving" phase stops eating minutes and tokens.
 
 ## What it adds
 
@@ -12,7 +14,8 @@ wall-clock cost of an agent step — for every session in the profile.
 | `turbo_parallel_subagents` tool | Splits a complex task into independent subtasks and prepares a parallel execution plan. The caller runs each planned `subagent` in parallel (DSH executes independent tool calls concurrently), then merges the outputs with `turbo_combine_results`. |
 | `turbo_combine_results` tool | Merges the text outputs of parallel subagents into a single coherent response. Used after `turbo_parallel_subagents`. |
 | `turbo:speed` prompt section | Standing system-prompt guidance (order 1550) teaching the model to batch independent calls into one turn and to reach for `read_many` / `workspace_map` first. Hidden automatically when the tools are restricted away. |
-| ⚡ Turbo button (web) | A pill toggle in the composer tool row (`conversation.input.right`, right before the send action). It flips the plugin's **volatile** `enabled` Config field through the settings controller (`remote.settings`); the loader commits volatile edits in place (no fiber restart) and the host plugin mounts/unmounts the tools and the prompt section on `loader/volatile-update`. The same toggle also shows up on the Settings page as the plugin's config form. |
+| `agent/request` effort hook | v1.4. While the pack is on, every model request is forced to the configured reasoning effort (`effort`, default `low`) — "Deep diving" gets short and cheap. Before injecting, the hook checks that `provider/model` actually declares the level in the LLM catalog (60 s cache; pi-ai throws `UNSUPPORTED_REASONING_EFFORT` for undeclared levels), so non-reasoning and foreign models are never touched. Cordis waterfall listeners run outermost-first in registration order and this hook registers at boot, so it wraps the per-agent model-selection middleware: while turbo is on, it wins over session/GUI selections. When turbo turns off, each touched agent gets a ONE-SHOT restore of its pre-turbo effort — necessary because DSH replays the last logged request config as the next request's seed, so without the restore the turbo level would stick to the session forever. The hook stays mounted for the fiber lifetime (not part of the volatile sync) precisely so the off-flip can still restore. |
+| ⚡ Turbo button (web) | A pill toggle in the composer tool row (`conversation.input.right`, right before the send action). Left click flips the plugin's **volatile** `enabled` Config field through the settings controller (`remote.settings`); the loader commits volatile edits in place (no fiber restart) and the host plugin mounts/unmounts the tools and the prompt section on `loader/volatile-update`. Right click cycles the forced `effort`: low → off → medium → high, and the pill shows the active level (⚡ Турбо ✓ · low). All three volatile fields (`enabled`, `effortControl`, `effort`) also show up on the Settings page as the plugin's config form. |
 
 ## Layout
 
@@ -21,10 +24,13 @@ package.json      — main lib/index.js, exports["./client"], dsh.bundle +
                     dsh.client manifests, dep @deepseek-ai/schemastery (Config schema)
 cordis.patch.yml  — bundle patch: inserts the { id: turbo, name: dsh-turbo } loader row
 lib/index.js     — host plugin: exports { name, inject, meta, Config, apply };
-                    Config.enabled is a volatile field (read via .get()); apply()
-                    mounts/unmounts registrations on loader/volatile-update
+                    Config fields (enabled, effortControl, effort) are volatile
+                    (read via .get()); apply() mounts/unmounts tool + prompt
+                    registrations on loader/volatile-update; the agent/request
+                    effort hook stays mounted for the whole fiber lifetime
 lib/client.js     — web half in the lazy-CJS window.__ModuleLoader__ format:
                     registers the Turbo toggle into conversation.input.right
+                    (left click = enable/disable, right click = cycle effort)
 LICENSE           — MIT license
 .gitignore        — node_modules, logs, OS files
 ```
@@ -87,12 +93,45 @@ the profile parsers reject it and the reload silently keeps the old tree.
 - Plugins page shows **Agent speed pack** as an installed, enabled bundle.
 - `plugin_manager list_bundles` → `dsh-turbo` with row `turbo` →
   `include:turbo`; `list_plugins` → `include:turbo`, `fiberPhase: "active"`.
-- Host Config inspect: `include:turbo` reports `status: "schema"` with an
-  `enabled` boolean (default true).
+- Host Config inspect: `include:turbo` reports `status: "schema"` with the
+  volatile `enabled` / `effortControl` / `effort` fields.
 - Host Tool inspect lists `read_many`, `workspace_map`, `turbo_parallel_subagents` and `turbo_combine_results` while enabled.
 - Web GUI: an **⚡ Турбо** pill sits in the composer row left of the send
   button; clicking it dims/undims and actually gates the tools (check Tool
-  inspect after flipping).
+  inspect after flipping). Right-click cycles `low → off → medium → high`
+  and the pill shows the level (⚡ Турбо ✓ · low).
+- Effort forcing: with turbo ON and `effort: low`, a sent message shows a
+  short «Глубокое погружение» phase (none at `off`), and the session log's
+  request header carries `reasoningEffort: low` even though the model
+  selector still shows the session's own level. Turning turbo OFF restores
+  the previous effort on the next request of every touched session.
+
+## Hardware turbo (profile side, RTX 3070)
+
+Cloud thinking cannot be hardware-accelerated — it can only be cut (the
+effort hook above) or parallelized. What CAN run on the local GPU is
+subagent work. The `desktop` profile registers an Ollama provider in its
+`cordis.patch.yml`:
+
+```yaml
+local:
+  displayName: Локальный (Ollama)
+  api: openai-completions
+  baseURL: http://127.0.0.1:11434/v1
+  reasoning: low
+  models:
+    - id: gpt-oss:20b   # MoE, hybrid VRAM+RAM, solid tool calling
+      reasoningEfforts: { off: null, low: low, medium: medium, high: high }
+    - id: llama3:8b     # fully in VRAM, weak at tools — plain-text tasks
+      reasoningEfforts: false
+```
+
+To let the agent dispatch subagents there: Settings → Subagents → enable
+per-subagent model selection and authorize the `local` routes (applies to
+new sessions). The agent then discovers routes with `list_subagent_models`
+and passes `provider: local, model: gpt-oss:20b, reasoning_effort: low` to
+`subagent` calls — free, private, and parallel on the GPU while the cloud
+model runs the main turn. Ollama must be running (tray app or `ollama serve`).
 
 ## Ideas for v2
 
@@ -101,3 +140,5 @@ the profile parsers reject it and the reload silently keeps the old tree.
 - Repeat-read dedup: a `tools/post-execute` hook that compresses a re-read of
   a file whose `fs/observed` version is unchanged into a one-line pointer.
 - Workspace-outline cache injected as a prompt variable on agent creation.
+- Speculative race: fire the same request at two routes (e.g. local GPU +
+  cloud) and keep the first usable answer — halves latency at 2× token cost.
